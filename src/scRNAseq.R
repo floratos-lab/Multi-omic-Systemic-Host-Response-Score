@@ -1,0 +1,807 @@
+# =============================================================================
+# Script:  scRNAseq.R
+# Purpose: End-to-end scRNA-seq analysis pipeline: per-sample QC, doublet
+#          removal, Seurat integration, clustering and cell type annotation,
+#          participant-level MoSS score projection.
+# =============================================================================
+# Configuration:
+#   out_dir          — output directory for all saved files and plots
+#   data_dir         — directory containing input .h5 files
+#   cellbender_files — logical; TRUE if inputs are CellBender-processed .h5
+#                      files, FALSE for standard 10x filtered .h5 files
+#
+# Functions defined:
+#
+#   qc_and_plots(obj, fname_prefix, out_dir)
+#     Adds MT, ribosomal, hemoglobin, and platelet percentage metrics to a
+#     Seurat object and saves 8 diagnostic PNGs: violin plots with and without
+#     points for all QC features, and feature scatter plots of nCount/nFeature
+#     vs. percent.mt, percent.ribo, and percent.hb. Returns the object with
+#     metrics added.
+#
+#   add_qc_metrics(obj)
+#     Adds percent.mt, percent.ribo, percent.hb, and percent.plat metadata
+#     columns to a Seurat object. Returns the updated object.
+#
+#   compute_thresholds(obj)
+#     Computes per-sample adaptive QC thresholds using median ± 3 MAD.
+#     Lower bounds are floored at nFeature ≥ 100 and nCount ≥ 200; upper
+#     bounds for percent.mt and percent.hb are capped at 20%. Upper bounds
+#     for nFeature and nCount are set at the 99.5th percentile to remove
+#     extreme outliers before doublet detection. Returns a named list of
+#     six threshold values.
+#
+# Workflow:
+#
+#   Part 1 — QC and doublet removal
+#     Loads .h5 files, creates per-sample Seurat objects (min.cells = 3,
+#     min.features = 200), merges all samples, and generates pre-filter QC
+#     plots. For each sample: adds QC metrics, applies adaptive thresholds,
+#     runs scDblFinder doublet detection, and retains singlets only.
+#     Saves pre_qc, post_qc, and qc_stats objects to seurat_objects.rda.
+#
+#   Part 2 — Integration and clustering
+#     Normalizes and identifies variable features per sample, selects
+#     integration features, finds CCA anchors, and integrates. Runs PCA
+#     (30 PCs), UMAP (dims 1–20), FindNeighbors (dims 1–20), and
+#     FindClusters (resolution = 0.5). Identifies cluster markers via
+#     FindAllMarkers (min.pct = 0.25, logfc.threshold = 0.25).
+#
+#   Part 3 — Cluster refinement and annotation
+#     Drops platelet/megakaryocyte cluster 21; merges closely related
+#     clusters (CD4 memory, cytotoxic CD8 T, memory B, monocytes, DC).
+#     Performs contamination re-screening using RBC, platelet, ambient Ig,
+#     and lineage cross-check module scores; removes flagged cells from
+#     monocyte (0_16) and DC (18_23) clusters using within-cluster
+#     median + 2 MAD thresholds. Assigns 18 cell type labels:
+#       cMono, ncMono, NK, Cycling CTL/NK, CD8 CTL, CD8 EM, CD8 Naive,
+#       CD4 Naive, CD4 Memory/Activated, CD4 Activated/Exhausted,
+#       Mixed Tcm, MAIT, B Naive/Transitional, B Memory, Plasmablasts,
+#       DC, Neu, Mast cells.
+#
+#   Part 4 — MoSS projection
+#     Reads MOFA Factor 1 scores from a user-selected CSV; joins to Seurat
+#     metadata by sample_id; generates MoSS UMAP plot for the full object.
+#
+#   Part 5 — cMono subclustering
+#     Subsets classical monocytes; runs NormalizeData, PCA (20 PCs),
+#     FindNeighbors (dims 1–10), FindClusters (resolution = 0.2), and UMAP.
+#     Drops doublet/contaminant subclusters 5 and 6. Assigns 6 subtypes:
+#       NLRP3 Inflammasome-primed, HLA-DR+/APC-primed, Resting (MNDA+),
+#       HMOX1+ Repair, Activated/moDC-like, CD14+CD16+ Intermediate.
+#     Generates subtype UMAP and MoSS projection plots.
+#
+#   Part 6 — Neutrophil subclustering
+#     Subsets neutrophils; runs the same preprocessing and clustering
+#     pipeline (resolution = 0.2). Assigns 4 subtypes:
+#       S100A8/A9+ Inflammatory, STAT1+ Mature, PADI4+ NET-primed,
+#       IL1B+/CXCL2+ Activated.
+#     Generates subtype UMAP and MoSS projection plots.
+#
+# Dependencies: Seurat, scCustomize, scDblFinder, SingleCellExperiment,
+#               SeuratExtend, dplyr, tibble, ggplot2, ggprism, RColorBrewer,
+#               grid, future, ggrepel
+# =============================================================================
+
+# Clear R environment 
+rm(list = ls())
+
+# Load packages
+library(Seurat)
+library(scCustomize)
+library(scDblFinder)
+library(SingleCellExperiment)
+library(SeuratExtend)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(ggprism)
+library(RColorBrewer)
+library(grid)
+library(future)
+library(ggrepel)
+
+# Specify directory where .h5 files are (data_dir) and directory where files
+# will be stored (out_dir)
+out_dir <- setwd("INSERT")
+data_dir <- "INSERT"
+
+# set to TRUE if input files are generated by cellbender; otherwise set to FALSE
+cellbender_files = TRUE 	
+if (cellbender_files) {
+  library(scCustomize)
+  filename_pattern <- "_filtered\\.h5"
+  gsub_pattern <- "-C-.*_filtered\\.h5"
+} else{
+  filename_pattern <- "^filtered_feature_bc_matrix_.*\\.h5$"
+  gsub_pattern <- "filtered_feature_bc_matrix_|\\.h5" 
+}
+
+# ----------------------------
+# Compute QC-related measures and generate plots: mitochondrial content,
+# ribosomal content , hemoglobin/platelet content (indicative of possible RBC 
+# contamination)
+# ----------------------------
+qc_and_plots <- function(obj, fname_prefix="", out_dir = getwd()){
+	obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+	obj[["percent.ribo"]] <- PercentageFeatureSet(obj, pattern = "^(RPL|RPS)")
+	obj[["percent.hb"]] <- PercentageFeatureSet(obj, pattern = "^(HBA|HBB|HBM|HBQ|HBZ)")
+	obj[["percent.plat"]] <- PercentageFeatureSet(obj, pattern = "PECAM1|PF4")
+	
+	# Visualy explore per-sample distributions. 
+	cnames<-setNames(rep(c("cyan3","darkgoldenrod1"),each=4),levels(factor(obj@meta.data$orig.ident)))
+	
+	feats <- c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo", 
+			"percent.hb", "percent.plat")
+	png(paste(out_dir, "/", fname_prefix, "_all_violin_plots_with_points.png", sep=""), 
+			width = 5000, height = 3500, res = 250)
+	p <- VlnPlot(obj, features = feats, layer="counts", group.by = "orig.ident", raster=FALSE, 
+			alpha=0.2, pt.size = 0.05, ncol = 3) + scale_fill_manual(values=cnames)
+	print(p)
+	dev.off()
+	
+	png(paste(out_dir, "/", fname_prefix, "_all_violin_plots_no_points.png", sep=""), 
+			width = 5000, height = 3500, res = 250)
+	p <- VlnPlot(obj, features = feats, layer="counts", group.by = "orig.ident", raster=FALSE, 
+			alpha=0.2, pt.size = 0, ncol = 3) + scale_fill_manual(values=cnames)
+	print(p)
+	dev.off()
+	
+	png(paste(out_dir, "/", fname_prefix, "_nCountRNA_vs_percent.mt.png", sep=""), 
+			width = 5000, height = 3500, res = 250)
+	p <- FeatureScatter(obj, feature1 = "percent.mt", feature2 ="nCount_RNA" , 
+			split.by="orig.ident")
+	print(p)
+	dev.off()
+	
+	png(paste(out_dir, "/", fname_prefix, "_nFeatureRNA_vs_percent.mt.png", sep=""), 
+			width = 5000, height = 3500, res = 250)
+	p <- FeatureScatter(obj, feature1 = "percent.mt", feature2 ="nFeature_RNA" , 
+			split.by="orig.ident")
+	print(p)
+	dev.off()
+	
+	png(paste(out_dir, "/", fname_prefix, "_nCountRNA_vs_percent.ribo.png", sep=""), 
+			width = 5000, height = 3500, res = 250)
+	p <- FeatureScatter(obj, feature1 = "percent.ribo", feature2 ="nCount_RNA" , 
+			split.by="orig.ident")
+	print(p)
+	dev.off()
+	
+	png(paste(out_dir, "/", fname_prefix, "_nFeatureRNA_vs_percent.ribo.png", sep=""), 
+			width = 5000, height = 3500, res = 250)
+	p <- FeatureScatter(obj, feature1 = "percent.ribo", feature2 ="nFeature_RNA" , 
+			split.by="orig.ident")
+	print(p)
+	dev.off()
+	
+	png(paste(out_dir, "/", fname_prefix, "_nCountRNA_vs_percent.hb.png", sep=""), 
+			width = 5000, height = 3500, res = 250)
+	p <- FeatureScatter(obj, feature1 = "percent.hb", feature2 ="nCount_RNA" , 
+			split.by="orig.ident")
+	print(p)
+	dev.off()
+	
+	png(paste(out_dir, "/", fname_prefix, "_nFeatureRNA_vs_percent.hb.png", sep=""), 
+			width = 5000, height = 3500, res = 250)
+	p <- FeatureScatter(obj, feature1 = "percent.hb", feature2 ="nFeature_RNA" , 
+			split.by="orig.ident")
+	print(p)
+	dev.off()
+	
+	# We can also look at the densities if desired; just uncomment the code block
+	# below and set the "x" argument to the metric of choice (e.g., nCount_RNA, 
+	# nFeatures_RNA, percent.mt, etc).
+	#metadata <- obj@meta.data
+	#cnames<-setNames(rep(c("cyan3","darkgoldenrod1"),each=4),levels(factor(metadata$orig.ident)))
+	#png(paste(out_dir, "/", fname_prefix, "_nCount_RNA_violin.png", sep=""),
+	#		width = 4000, height = 2500, res = 250)
+	#p <- metadata %>% ggplot(aes(color=orig.ident, x=nCount_RNA, fill= orig.ident)) + 
+	#		geom_density(alpha = 0.2) + 
+	#		theme_classic() +
+	#		scale_x_log10() + 
+	#		geom_vline(xintercept = 650,color="red",linetype="dotted")
+	#	print(p)
+	#	dev.off()
+	
+	return(obj)
+}
+
+# ----------------------------
+# Add QC metrics (MT/Ribo/Hb/Plat)
+# ----------------------------
+add_qc_metrics <- function(obj) {
+	obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+	obj[["percent.ribo"]] <- PercentageFeatureSet(obj, pattern = "^(RPL|RPS)")
+	obj[["percent.hb"]] <- PercentageFeatureSet(obj, pattern = "^(HBA|HBB|HBM|HBQ|HBZ)")
+	obj[["percent.plat"]] <- PercentageFeatureSet(obj, pattern = "PECAM1|PF4")
+	
+	return(obj)
+}
+
+# ----------------------------
+# Compute robust, adaptive, per-sample thresholds
+#	- Lower bounds: remove empties/debris (very low nFeature/nCount)
+#	- Upper bounds: trim extreme outliers (often multiplets). More refined
+#		trimming will be performed by the doublet removal method later.
+#	- percent.mt upper bound: remove stressed/dying cells
+#	- perecent.hb upper bound: remove red blood cells
+# ----------------------------
+compute_thresholds <- function(obj) {
+	robust_low  <- function(x) median(x) - 3*mad(x)
+	robust_high <- function(x) median(x) + 3*mad(x)
+	
+	nf  <- obj$nFeature_RNA
+	nc  <- obj$nCount_RNA
+	pm  <- obj$percent.mt
+	phb <- obj$percent.hb
+	
+	nf_min <- floor(max(100, robust_low(nf)))
+	nc_min <- floor(max(200, robust_low(nc)))
+	pm_max <- ceiling(min(20, robust_high(pm)))          # cap mito at ~20%
+	phb_max <- ceiling(min(20, robust_high(phb)))        # cap hb at ~20%
+	
+	# Optional upper caps to limit extreme outliers before doublet-calling
+	nf_max <- floor(quantile(nf, 0.995, na.rm = TRUE))   # top 0.5%
+	nc_max <- floor(quantile(nc, 0.995, na.rm = TRUE))
+	
+	list(nf_min = nf_min, nc_min = nc_min, nf_max = nf_max,	nc_max = nc_max,  
+			pm_max = pm_max, phb_max = phb_max)
+}
+
+# =============================
+# Load and merge .h5 files
+# =============================
+
+sample_files <- list.files(path = data_dir,	pattern = filename_pattern,
+		full.names = TRUE)
+sample_names <- gsub(gsub_pattern, "", basename(sample_files))
+
+seurat_list <- lapply(seq_along(sample_files), function(i) {
+			if(cellbender_files)
+				counts <- Read_CellBender_h5_Mat(file_name = sample_files[i])
+			else
+				counts <- Read10X_h5(sample_files[i])
+			obj <- CreateSeuratObject(counts = counts, project = sample_names[i], min.cells = 3, min.features = 200)
+			obj$sample_id <- sample_names[i]
+			return(obj)
+		})
+names(seurat_list) <- sample_names
+
+# Combine samples, compute qc metrics and generate plots to use for empirically
+# assessing sample quality.
+merged_obj <- Reduce(function(x, y) merge(x, y, add.cell.ids = c(x$sample_id[1], 
+							y$sample_id[1])), seurat_list)
+merged_obj <- qc_and_plots(merged_obj, fname_prefix = "pre_filter")
+
+
+# Peform per-sample qc
+per_sample_summary <- list()
+seu_list_qc <- list()
+
+for (ind in 1:length(seurat_list)) {
+	sample_id <- names(seurat_list)[ind]
+	message("\n===== Processing: ", sample_id, " =====")
+	seu <- seurat_list[[ind]]
+	
+	# Add QC metrics
+	seu <- add_qc_metrics(seu)
+	
+	# Compute thresholds and apply filtering
+	th <- compute_thresholds(seu)
+	message(sprintf("Thresholds [%s]: nFeature %d..%d | nCount %d..%d | percent.mt <= %d | percent.hb <= %d",
+					sample_id, th$nf_min, th$nf_max, th$nc_min, th$nc_max, th$pm_max, th$phb_max))
+	
+	n_before <- ncol(seu)
+	seu_qc <- subset(
+			seu,
+			subset = nFeature_RNA >= th$nf_min & nFeature_RNA <= th$nf_max &
+					nCount_RNA   >= th$nc_min & nCount_RNA   <= th$nc_max &
+					percent.mt   <= th$pm_max & percent.hb   <= th$phb_max
+	)
+	n_after <- ncol(seu_qc)
+	message(sprintf("Cells retained for %s: %d / %d (%.1f%%)",
+					sample_id, n_after, n_before, 100*n_after/n_before))
+	
+	# Doublet detection per sample, using scDblFinder. Per published comparison, 
+	# (PMID: 33338399), this performs better than DoubletFinder. If desired, we
+	# can chain the two methods, i.e., run DoubletFinder after scDblFinder.
+	message("Running scDblFinder for sample: ", sample_id)
+	sce <- as.SingleCellExperiment(seu_qc)
+	sce <- scDblFinder(sce)
+	seu_qc$doublet_class <- sce$scDblFinder.class
+	tbl <- table(seu_qc$doublet_class)
+	message("Doublet classes: "); print(tbl)
+	seu_qc <- subset(seu_qc, subset = (doublet_class == "singlet"))
+	n_after <- ncol(seu_qc)
+	
+	# Record summary
+	per_sample_summary[[sample_id]] <- data.frame(
+			sample      = sample_id,
+			cells_before= n_before,
+			cells_after = n_after,
+			pct_retained= round(100*n_after/n_before, 1),
+			nf_min = th$nf_min, nf_max = th$nf_max,
+			nc_min = th$nc_min, nc_max = th$nc_max,
+			pm_max = th$pm_max,
+			phb_max = th$phb_max,
+			stringsAsFactors = FALSE
+	)
+	
+	# Store for merging
+	seu_list_qc[[sample_id]] <- seu_qc
+}
+
+# Generate Seurat object for filtered data set and re-generate QC plots, for 
+# comparison
+filtered_obj <- Reduce(function(x, y) merge(x, y, add.cell.ids = c(x$sample_id[1], 
+							y$sample_id[1])), seu_list_qc)
+filtered_obj <- qc_and_plots(filtered_obj, fname_prefix = "post_filter") 
+
+# Save pre- and post-filter Seurat objects, to avoid having to regenerate
+README <- function(){
+	writeLines("This file contains Seurat objects comprising the pre- and post-QC scRNAseq samples:")
+	writeLines("\t* pre_qc:\tContains the samples prior to QC.")
+	writeLines("\t* post_qc:\tContains the samples following QC.")
+	writeLines("\t* qc_stats:\tSummary statistics table, describing the outcome of the QC process.")
+}
+pre_qc = merged_obj
+post_qc = filtered_obj
+qc_stats = as.matrix(sapply(per_sample_summary, function(x){x}))
+save(pre_qc, post_qc, qc_stats, README, file = paste(out_dir, "/seurat_objects.rda", sep=""))
+
+# =============================
+# Integration with Seurat
+# =============================
+singlet_list <- seu_list_qc
+singlet_list <- lapply(singlet_list, function(obj) {
+			obj <- NormalizeData(obj)
+			obj <- FindVariableFeatures(obj)
+			return(obj)
+		})
+
+features <- SelectIntegrationFeatures(object.list = singlet_list)
+anchors <- FindIntegrationAnchors(object.list = singlet_list, anchor.features = features)
+integrated_obj <- IntegrateData(anchorset = anchors)
+
+# =============================
+# Clustering
+# =============================
+# Use integrated assay for clustering
+DefaultAssay(integrated_obj) <- "integrated"
+integrated_obj <- ScaleData(integrated_obj)
+integrated_obj <- RunPCA(integrated_obj, npcs = 30)
+integrated_obj <- RunUMAP(integrated_obj, dims = 1:20)
+integrated_obj <- FindNeighbors(integrated_obj, dims = 1:20)
+integrated_obj <- FindClusters(integrated_obj, resolution = 0.5)
+
+# =============================
+# Marker Gene Identification
+# =============================
+integrated_obj[["RNA"]] <- JoinLayers(integrated_obj[["RNA"]])
+
+DefaultAssay(integrated_obj) <- "RNA"
+
+cluster_markers <- FindAllMarkers(integrated_obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+top_markers <- cluster_markers %>%
+		group_by(cluster) %>%
+		top_n(n = 100, wt = avg_log2FC)
+write.csv(top_markers, file = "top100_markers_per_cluster.csv", row.names = FALSE)
+
+# =============================
+# Save key files
+# =============================
+saveRDS(integrated_obj, "integrated_obj.rds")
+saveRDS(cluster_markers, "cluster_markers.rds")
+saveRDS(top_markers, "top_markers.rds")
+
+# =============================
+# Cluster Refinement & Annotation
+# =============================
+# Use the original cluster IDs as identities
+integrated_obj_clean <- integrated_obj
+Idents(integrated_obj_clean) <- "seurat_clusters"
+
+# ---- DROP PLATELETS/MEGAKARYOCYTES (cluster 21) ----
+if ("21" %in% levels(Idents(integrated_obj_clean))) {
+  integrated_obj_clean <- subset(integrated_obj_clean, idents = "21", invert = TRUE)
+}
+
+# ---- MERGE LINES (collapse cluster IDs) ----
+merged_ids <- as.character(Idents(integrated_obj_clean))
+
+merged_ids[merged_ids %in% c("1","6","9")] <- "1_6_9"  # CD4 memory/activated
+merged_ids[merged_ids %in% c("3","17")]    <- "3_17"   # Cytotoxic CD8 T
+merged_ids[merged_ids %in% c("7","14")]    <- "7_14"   # Memory B
+merged_ids[merged_ids %in% c("0","16")]    <- "0_16"   # Monocytes (classical + ISG/activated)
+merged_ids[merged_ids %in% c("18","23")]   <- "18_23"   # DC (cDC + pDC)
+
+# Assign the merged ids back
+integrated_obj_clean$merged_clusters <- factor(merged_ids)
+Idents(integrated_obj_clean) <- "merged_clusters"
+
+#Re-assess for plt/RBC contamination, ambient Igs, lineage cross-checks
+Idents(integrated_obj_clean) <- "merged_clusters"
+meta <- integrated_obj_clean@meta.data
+
+# Per-cell simple scores
+scores <- FetchData(integrated_obj_clean, vars = c(
+  "HBA1","HBA2","HBB","PF4","PPBP","NRGN",                    # RBC/platelet
+  "IGKC","IGLC1","JCHAIN","IGHG1","IGHG3","IGHA1",            # Ig/ambient
+  "CD3E","CD3D","MS4A1","CD14","LYZ","FCGR3A"                 # lineage cross-checks
+))
+
+scores$cell <- rownames(scores)
+scores$cluster <- Idents(integrated_obj_clean)
+
+# Flag rules
+scores <- scores %>%
+  mutate(
+    rbc_plat = HBA1+HBA2+HBB + PF4+PPBP+NRGN,
+    ig_ambient = IGKC+IGLC1+JCHAIN+IGHG1+IGHG3+IGHA1,
+    cd3_b_mix = pmax(CD3E,CD3D) * MS4A1,
+    mono_b_mix = (CD14+LYZ) * MS4A1
+  )
+
+cluster_flags <- scores %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    rbc_plat_hi = mean(rbc_plat > 1),        # tweak thresholds as needed
+    ig_ambient_hi = mean(ig_ambient > 1),
+    cd3_b_mix_hi = mean(cd3_b_mix > 0.5),
+    mono_b_mix_hi = mean(mono_b_mix > 0.5)
+  ) %>%
+  arrange(desc(rbc_plat_hi + ig_ambient_hi + cd3_b_mix_hi + mono_b_mix_hi))
+
+#Further filter plt/RBCs
+# Gene sets (extendable)
+rbc_genes <- c("HBA1","HBA2","HBB","HBD","ALAS2","AHSP")
+plt_genes <- c("PF4","PPBP","GP9","GP1BA","GP1BB","ITGA2B","ITGB3","CLEC1B","SPARC")
+
+# Module scores
+integrated_obj_clean <- AddModuleScore(
+  integrated_obj_clean,
+  features = list(rbc_genes, plt_genes),
+  name = c("RBC","PLT")
+)
+
+# Choose within-cluster thresholds 
+obj_016 <- subset(integrated_obj_clean, idents = "0_16")
+thr_rbc <- median(obj_016$RBC1) + 2*mad(obj_016$RBC1)
+thr_plt <- median(obj_016$PLT2) + 2*mad(obj_016$PLT2)
+
+cells_drop_016 <- WhichCells(
+  obj_016,
+  expression = RBC1 > thr_rbc | PLT2 > thr_plt
+)
+
+# (Optional) apply same logic to DCs (merged cDC + pDC)
+obj_18_23 <- subset(integrated_obj_clean, idents = "18_23")
+thr_rbc_18_23 <- median(obj_18_23$RBC1) + 2*mad(obj_18_23$RBC1)
+thr_plt_18_23 <- median(obj_18_23$PLT2) + 2*mad(obj_18_23$PLT2)
+cells_drop_18_23 <- WhichCells(
+  obj_18_23,
+  expression = RBC1 > thr_rbc_18_23 | PLT2 > thr_plt_18_23
+)
+
+# Remove flagged cells from both Monocytes (0_16) and DCs (18_23)
+cells_to_drop <- unique(c(cells_drop_016, cells_drop_18_23))
+integrated_obj_clean <- subset(integrated_obj_clean, cells = cells_to_drop, invert = TRUE)
+
+# ---- ADD CLUSTER LABELS (keys are current merged IDs) ----
+cluster_labels <- c(
+  "0_16" = "cMono",               
+  "8"    = "ncMono",              
+  
+  "4"    = "NK",
+  "19"   = "Cycling CTL/NK",
+  
+  "3_17" = "CD8 CTL",
+  "5"    = "CD8 EM",
+  "11"   = "CD8 Naive",
+  
+  "2"    = "CD4 Naive",
+  "1_6_9"= "CD4 Memory/Activated",
+  "15"   = "CD4 Activated/Exhausted",
+  "10"   = "Mixed Tcm",
+  
+  "13"   = "MAIT",
+  
+  "12"   = "B Naive/Transitional",
+  "7_14" = "B Memory",
+  "22"   = "Plasmablasts",        
+  "18_23"   = "DC",                 
+  
+  "20"   = "Neu",
+  "24"   = "Mast cells"
+)
+
+# Assign labels
+integrated_obj_clean$celltype <- unname(cluster_labels[Idents(integrated_obj_clean)])
+Idents(integrated_obj_clean) <- "celltype"
+
+integrated_obj_clean$celltype <- plyr::mapvalues(
+  integrated_obj_clean$merged_clusters,
+  from = names(cluster_labels),
+  to   = cluster_labels
+)
+
+n_cells <- length(unique(integrated_obj_clean$celltype))
+set2_palette <- colorRampPalette(brewer.pal(15, "Set2"))(n_cells)
+
+cell_type_dimplot <- DimPlot(
+  integrated_obj_clean,
+  group.by = "celltype",
+  label = TRUE,
+  repel = TRUE,
+  raster = FALSE,
+  cols = set2_palette,
+  pt.size = 0.05,
+  label.size = 6
+) +
+  theme_umap_arrows(
+    line_length = unit(20, "mm"),
+    arrow_length = unit(2.5, "mm"),
+    line_width = 2.5,
+    text_size = 12,
+    x_label = "UMAP 1",
+    y_label = "UMAP 2"
+  ) +
+  theme(legend.position = "none", plot.title = element_blank())
+
+# =============================
+# Plot MoSS values on UMAP
+# =============================
+
+# Read in the factor scores file
+factor_scores <- read.csv(file.choose(), header = TRUE, check.names = FALSE, stringsAsFactors = FALSE)
+colnames(factor_scores)[1] <- "sample_id"
+
+# Ensure factor file uses hyphens 
+factor_scores$sample_id <- gsub("_", "-", factor_scores$sample_id)
+
+# Clean Seurat orig.ident -> base ID with hyphens
+clean_base_id <- function(x) {
+  x <- as.character(x)
+  x <- gsub("_filtered$", "", x)          # drop trailing "_filtered"
+  x <- gsub("-{2,}", "-", x)              # collapse repeated dashes
+  sub("^([^-]+-[^-]+-[^-]+).*", "\\1", x) # keep first 3 dash-delimited parts
+}
+
+meta <- integrated_obj_clean@meta.data
+meta$barcode   <- rownames(meta)
+meta$sample_id <- clean_base_id(meta$orig.ident)   
+
+# Join
+meta_merged <- left_join(meta, factor_scores, by = "sample_id")
+
+# Rename Factor1 -> MoSS and ensure it's numeric
+meta_merged$MoSS <- as.numeric(meta_merged$Factor1)
+
+# Create MoSS tertile groups
+meta_merged$MoSS_group <- cut(meta_merged$MoSS,
+		breaks = quantile(meta_merged$MoSS, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE),
+		labels = c("Low", "Mid", "High"),
+		include.lowest = TRUE)
+
+# Add updated metadata back to Seurat object
+rownames(meta_merged) <- meta_merged$barcode
+integrated_obj_clean@meta.data <- meta_merged
+
+# Get UMAP coordinates
+umap_coords <- Embeddings(integrated_obj_clean, "umap")
+meta_df <- integrated_obj_clean@meta.data
+meta_df$UMAP_1 <- umap_coords[, 1]
+meta_df$UMAP_2 <- umap_coords[, 2]
+
+# Plot MoSS values on full UMAP
+cell_type_dimplot_MoSS <- ggplot(meta_df, aes(x = UMAP_1, y = UMAP_2, color = MoSS)) +
+		geom_point(size = 0.05) +
+		scale_color_gradient2(
+				low = "gray85",
+				mid = "lightgray",
+				high = "#023858",
+				midpoint = 0,
+				limits = c(-3, 3),
+				name = "MoSS"
+		) +
+		theme_prism(base_size = 16) +
+		theme(
+				panel.grid = element_blank(),
+				axis.title = element_blank(),
+				axis.text = element_blank(),
+				axis.ticks = element_blank(),
+				axis.line = element_blank(),
+				plot.title = element_blank(),
+				legend.title = element_text(size = 16, face = "bold")
+		)
+
+# =============================
+# Subcluster classical monocytes (cMono)
+# =============================
+
+# Subset cMono cells
+cmono <- subset(integrated_obj_clean, subset = celltype == "cMono")
+
+# Preprocessing
+future::plan("sequential")
+cmono <- NormalizeData(cmono, verbose = TRUE)
+cmono <- FindVariableFeatures(cmono)
+cmono <- ScaleData(cmono)
+cmono <- RunPCA(cmono, npcs = 20)
+
+# Clustering
+cmono <- FindNeighbors(cmono, dims = 1:10)
+cmono <- FindClusters(cmono, resolution = 0.2)  
+cmono <- RunUMAP(cmono, dims = 1:10)
+
+# Find markers for subclusters
+cmono_markers <- FindAllMarkers(cmono, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+write.csv(cmono_markers, "cmono_markers.csv", row.names = FALSE)
+
+top_cmono_markers <- cmono_markers %>% group_by(cluster) %>% top_n(10, avg_log2FC)
+write.csv(top_cmono_markers, "top_cmono_markers.csv", row.names = FALSE)
+
+# Reassign identities to ensure levels are updated
+cmono <- SetIdent(cmono, value = "seurat_clusters")
+
+# Drop the doublet/contaminant subclusters 5 and 6
+if (all(c("5","6") %in% levels(Idents(cmono)))) {
+  cmono <- subset(cmono, idents = c("5","6"), invert = TRUE)
+}
+
+# Assign cMono subtypes
+cmono$cmono_subtype <- recode(as.character(Idents(cmono)),
+		"0" = "NLRP3 Inflammasome-primed",
+		"1" = "HLA-DR+/APC-primed",
+		"2" = "Resting (MNDA+)",
+		"3" = "HMOX1+ Repair",
+		"4" = "Activated/moDC-like",
+		"7" = "CD14+CD16+ Intermediate"
+)
+
+# Set up color palette
+cmono_types <- sort(unique(cmono$cmono_subtype))          
+set2_palette <- brewer.pal(8, "Set2")[1:length(cmono_types)]
+names(set2_palette) <- cmono_types                      
+
+# Final UMAP plot for cMono subtypes
+cmono_type_dimplot <- DimPlot(
+				cmono,
+				reduction = "umap",
+				group.by = "cmono_subtype",
+				label = TRUE,
+				repel = TRUE,
+				pt.size = 0.1,
+				cols = set2_palette,
+				label.size = 6
+		) +
+		theme_umap_arrows(
+				line_length = unit(20, "mm"),
+				arrow_length = unit(2.5, "mm"),
+				line_width = 2.5,
+				text_size = 12,
+				x_label = "UMAP 1",
+				y_label = "UMAP 2"
+		) +
+		theme(legend.position = "none", plot.title = element_blank())
+
+# =============================
+# Plot MoSS values on cMono UMAP
+# =============================
+
+# Extract UMAP coordinates
+umap_coords <- Embeddings(cmono, "umap")
+meta_df <- cmono@meta.data
+meta_df$UMAP_1 <- umap_coords[, 1]
+meta_df$UMAP_2 <- umap_coords[, 2]
+
+# Project MoSS onto cMono UMAP
+meta_df$MoSS <- as.numeric(meta_df$Factor1)
+
+# Plot MoSS values on cMono UMAP
+cmono_type_dimplot_MoSS <- ggplot(meta_df, aes(x = UMAP_1, y = UMAP_2, color = MoSS)) +
+		geom_point(size = 0.1, alpha = 1) +
+		scale_color_gradient2(
+				low = "darkgrey",
+				mid = "lightgray",
+				high = "#023858",
+				midpoint = 0,
+				limits = c(-3, 3),
+				name = "MoSS"
+		) +
+		theme_prism(base_size = 16) +
+		theme(
+				panel.grid = element_blank(),
+				axis.title = element_blank(),
+				axis.text = element_blank(),
+				axis.ticks = element_blank(),
+				axis.line = element_blank(),
+				plot.title = element_blank(),
+				legend.title = element_text(size = 16, face = "bold")
+		)
+
+# =============================
+# Subcluster neutrophils
+# =============================
+
+# Subset neutrophils
+neut <- subset(integrated_obj_clean, subset = celltype == "Neu")
+
+# Preprocessing
+neut <- NormalizeData(neut)
+neut <- FindVariableFeatures(neut)
+neut <- ScaleData(neut)
+neut <- RunPCA(neut, npcs = 20)
+
+# Clustering
+neut <- FindNeighbors(neut, dims = 1:10)
+neut <- FindClusters(neut, resolution = 0.2)  
+neut <- RunUMAP(neut, dims = 1:10)
+
+# Find markers for subclusters
+neut_markers <- FindAllMarkers(neut, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+write.csv(neut_markers, "neutrophil_markers.csv", row.names = FALSE)
+
+top_neut_markers <- neut_markers %>% group_by(cluster) %>% top_n(10, avg_log2FC)
+write.csv(top_neut_markers, "top_neutrophil_markers.csv", row.names = FALSE)
+
+#Relabel neutrophils
+neut$neut_subtype <- recode(as.character(Idents(neut)),
+		"0" = "S100A8/A9+ Inflammatory",
+		"1" = "STAT1+ Mature",
+		"2" = "PADI4+ NET-primed",
+		"3" = "IL1B+/CXCL2+ Activated")
+
+neut_types <- sort(unique(neut$neut_subtype))          
+set2_palette <- brewer.pal(8, "Set2")[1:length(neut_types)]
+names(set2_palette) <- neut_types                      
+
+#Final plot
+neutrophil_type_dimplot <- DimPlot(neut, reduction = "umap", group.by = "neut_subtype", label = TRUE, repel = TRUE, pt.size = 0.75,
+				cols = set2_palette, label.size  = 6) +
+		theme_umap_arrows(
+				line_length = unit(20, "mm"),
+				arrow_length = unit(2.5, "mm"),
+				line_width   = 2.5,
+				text_size    = 12,
+				x_label      = "UMAP 1",
+				y_label      = "UMAP 2"
+		) +
+		theme(legend.position = "none", plot.title = element_blank())
+
+# =============================
+# Plot MoSS values on neutrophil UMAP
+# =============================
+
+# Extract UMAP coordinates
+umap_coords <- Embeddings(neut, "umap")
+meta_df <- neut@meta.data
+meta_df$UMAP_1 <- umap_coords[, 1]
+meta_df$UMAP_2 <- umap_coords[, 2]
+
+# Rename and confirm MoSS values
+meta_df$MoSS <- as.numeric(meta_df$Factor1)
+
+# Plot MoSS values on neutrophil UMAP
+neutrophil_type_dimplot_MoSS <- ggplot(meta_df, aes(x = UMAP_1, y = UMAP_2, color = MoSS)) +
+		geom_point(size = 0.75, alpha = 1) +
+		scale_color_gradient2(
+				low = "darkgrey",
+				mid = "lightgray",
+				high = "#023858",
+				midpoint = 0,
+				limits = c(-3, 3),
+				name = "MoSS"
+		) +
+		theme_prism(base_size = 16) +
+		theme(
+				panel.grid = element_blank(),
+				axis.title = element_blank(),
+				axis.text = element_blank(),
+				axis.ticks = element_blank(),
+				axis.line = element_blank(),
+				plot.title = element_blank(),
+				legend.title = element_text(size = 16, face = "bold")
+		)
