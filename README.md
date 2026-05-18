@@ -67,7 +67,7 @@ MoSS/
 
 5. **Build compact projection models**
    - Use LASSO feature pre-selection followed by recursive feature elimination (RFE) in RESERVE-U-2-TOR.
-   - Select compact transcriptomic and proteomic signatures, including the 14-gene RNA-seq model used for external projection.
+   - Select compact transcriptomic signatures, resulting in 14-gene RNA-seq model used for external projection.
    - Evaluate model performance in RESERVE-U-1-EBB.
 
 6. **Perform single-cell analyses in RESERVE-U-2-TOR**
