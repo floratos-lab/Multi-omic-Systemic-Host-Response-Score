@@ -78,6 +78,10 @@
 #       IL1B+/CXCL2+ Activated.
 #     Generates subtype UMAP and MoSS projection plots.
 #
+#   Part 7 — Targeted neutrophil-monocyte coupling analyses
+#     Tests whether MoSS-enriched neutrophil and monocyte programs vary
+#     independently or as a coordinated cross-cell inflammatory state.
+#
 # Dependencies: Seurat, scCustomize, scDblFinder, SingleCellExperiment,
 #               SeuratExtend, dplyr, tibble, ggplot2, ggprism, RColorBrewer,
 #               grid, future, ggrepel
@@ -805,3 +809,360 @@ neutrophil_type_dimplot_MoSS <- ggplot(meta_df, aes(x = UMAP_1, y = UMAP_2, colo
 				plot.title = element_blank(),
 				legend.title = element_text(size = 16, face = "bold")
 		)
+
+# =============================
+# Cross-compartment pseudobulk ligand-receptor/inflammasome correlation
+# =============================
+
+# Neutrophil-side candidate ligands/alarmins
+neut_lr_genes <- c(
+  "S100A8", "S100A9", "HMGB1", "IL1B", "CXCL8",
+  "CXCL2", "LCN2", "MMP8", "MMP9", "PADI4"
+)
+
+# Monocyte-side candidate receptors/inflammasome-response genes
+mono_lr_genes <- c(
+  "TLR4", "AGER", "NLRP3", "IL1B", "CASP1",
+  "PYCARD", "CXCL8", "TNF", "NFKBIA"
+)
+
+# Ensure RNA assay is active
+DefaultAssay(neut) <- "RNA"
+DefaultAssay(cmono) <- "RNA"
+
+# Ensure sample_id exists
+if (!"sample_id" %in% colnames(neut@meta.data)) {
+  neut$sample_id <- clean_base_id(neut$orig.ident)
+}
+
+if (!"sample_id" %in% colnames(cmono@meta.data)) {
+  cmono$sample_id <- clean_base_id(cmono$orig.ident)
+}
+
+# Ensure MoSS exists
+if (!"MoSS" %in% colnames(neut@meta.data)) {
+  neut$MoSS <- as.numeric(neut$Factor1)
+}
+
+if (!"MoSS" %in% colnames(cmono@meta.data)) {
+  cmono$MoSS <- as.numeric(cmono$Factor1)
+}
+
+# Keep only genes present in each object
+neut_lr_genes_present <- intersect(neut_lr_genes, rownames(neut))
+mono_lr_genes_present <- intersect(mono_lr_genes, rownames(cmono))
+
+cat("Neutrophil ligand/alarmin genes present:\n")
+print(neut_lr_genes_present)
+
+cat("Monocyte receptor/inflammasome genes present:\n")
+print(mono_lr_genes_present)
+
+if (length(neut_lr_genes_present) < 3) {
+  warning("Fewer than 3 neutrophil ligand/alarmin genes detected in neut object.")
+}
+
+if (length(mono_lr_genes_present) < 3) {
+  warning("Fewer than 3 monocyte receptor/inflammasome genes detected in cmono object.")
+}
+
+# -----------------------------
+# Helper: calculate participant-level pseudobulk average expression
+# -----------------------------
+
+get_sample_pseudobulk <- function(obj, genes, group_col = "sample_id", prefix = "gene") {
+  
+  DefaultAssay(obj) <- "RNA"
+  
+  genes <- intersect(genes, rownames(obj))
+  
+  # Seurat v5 uses layer instead of slot
+  expr <- GetAssayData(obj, assay = "RNA", layer = "data")[genes, , drop = FALSE]
+  
+  meta <- obj@meta.data
+  meta$cell <- rownames(meta)
+  
+  samples <- sort(unique(meta[[group_col]]))
+  
+  pb_list <- lapply(samples, function(sid) {
+    cells_use <- rownames(meta)[meta[[group_col]] == sid]
+    cells_use <- intersect(cells_use, colnames(expr))
+    
+    if (length(cells_use) == 0) {
+      return(NULL)
+    }
+    
+    gene_means <- Matrix::rowMeans(expr[, cells_use, drop = FALSE])
+    
+    out <- as.data.frame(t(as.matrix(gene_means)))
+    colnames(out) <- paste0(prefix, "_", colnames(out))
+    out[[group_col]] <- sid
+    out$n_cells <- length(cells_use)
+    out
+  })
+  
+  pb <- bind_rows(pb_list)
+  
+  return(pb)
+}
+
+# Calculate pseudobulk average expression by participant
+neut_lr_pseudobulk <- get_sample_pseudobulk(
+  obj = neut,
+  genes = neut_lr_genes_present,
+  group_col = "sample_id",
+  prefix = "neut"
+)
+
+mono_lr_pseudobulk <- get_sample_pseudobulk(
+  obj = cmono,
+  genes = mono_lr_genes_present,
+  group_col = "sample_id",
+  prefix = "mono"
+)
+
+# Rename n_cells columns
+neut_lr_pseudobulk <- neut_lr_pseudobulk %>%
+  dplyr::rename(neut_cells = n_cells)
+
+mono_lr_pseudobulk <- mono_lr_pseudobulk %>%
+  dplyr::rename(cmono_cells = n_cells)
+
+# Add MoSS by participant
+moss_by_sample <- neut@meta.data %>%
+  as_tibble(rownames = "cell") %>%
+  group_by(sample_id) %>%
+  summarise(
+    MoSS = median(MoSS, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Merge cross-compartment pseudobulk table
+lr_pseudobulk_coupling <- neut_lr_pseudobulk %>%
+  inner_join(mono_lr_pseudobulk, by = "sample_id") %>%
+  left_join(moss_by_sample, by = "sample_id") %>%
+  arrange(desc(MoSS))
+
+# -----------------------------
+# Create compact pseudobulk module scores
+# -----------------------------
+
+# Z-score genes across participants before averaging so highly expressed genes
+# do not dominate the module score.
+neut_gene_cols <- grep("^neut_", colnames(lr_pseudobulk_coupling), value = TRUE)
+mono_gene_cols <- grep("^mono_", colnames(lr_pseudobulk_coupling), value = TRUE)
+
+# Remove cell-count columns from gene columns
+neut_gene_cols <- setdiff(neut_gene_cols, c("neut_cells"))
+mono_gene_cols <- setdiff(mono_gene_cols, c("mono_cells", "cmono_cells"))
+
+# Explicitly use dplyr::select to avoid namespace conflicts
+neut_scaled_mat <- scale(as.matrix(dplyr::select(lr_pseudobulk_coupling, dplyr::all_of(neut_gene_cols))))
+mono_scaled_mat <- scale(as.matrix(dplyr::select(lr_pseudobulk_coupling, dplyr::all_of(mono_gene_cols))))
+
+lr_pseudobulk_coupling$neut_ligand_alarmin_pseudobulk_score <- rowMeans(
+  neut_scaled_mat,
+  na.rm = TRUE
+)
+
+lr_pseudobulk_coupling$mono_receptor_inflammasome_pseudobulk_score <- rowMeans(
+  mono_scaled_mat,
+  na.rm = TRUE
+)
+
+# Save participant-level pseudobulk table
+write.csv(
+  lr_pseudobulk_coupling,
+  "participant_level_cross_compartment_pseudobulk_lr_coupling.csv",
+  row.names = FALSE
+)
+
+# -----------------------------
+# Correlate neutrophil ligand/alarmin pseudobulk score with monocyte score
+# -----------------------------
+
+cor_lr_pseudobulk <- cor.test(
+  lr_pseudobulk_coupling$neut_ligand_alarmin_pseudobulk_score,
+  lr_pseudobulk_coupling$mono_receptor_inflammasome_pseudobulk_score,
+  method = "spearman",
+  exact = FALSE
+)
+
+lr_pseudobulk_cor_summary <- data.frame(
+  comparison = "Neutrophil ligand/alarmin pseudobulk score vs monocyte receptor/inflammasome pseudobulk score",
+  spearman_rho = unname(cor_lr_pseudobulk$estimate),
+  p_value = cor_lr_pseudobulk$p.value,
+  n_participants = nrow(lr_pseudobulk_coupling),
+  neutrophil_genes = paste(neut_lr_genes_present, collapse = ";"),
+  monocyte_genes = paste(mono_lr_genes_present, collapse = ";")
+)
+
+write.csv(
+  lr_pseudobulk_cor_summary,
+  "cross_compartment_pseudobulk_lr_correlation_summary.csv",
+  row.names = FALSE
+)
+
+print(lr_pseudobulk_cor_summary)
+
+# -----------------------------
+# Plot cross-compartment pseudobulk coupling and pairwise gene correlations
+# -----------------------------
+
+# Needed for ggarrange
+library(ggpubr)
+
+rho_label_lr <- paste0(
+  "Spearman rho = ", round(unname(cor_lr_pseudobulk$estimate), 2),
+  "\nP = ", signif(cor_lr_pseudobulk$p.value, 2)
+)
+
+# Panel A: participant-level pseudobulk module correlation
+lr_pseudobulk_coupling_plot <- ggplot(
+  lr_pseudobulk_coupling,
+  aes(
+    x = neut_ligand_alarmin_pseudobulk_score,
+    y = mono_receptor_inflammasome_pseudobulk_score
+  )
+) +
+  geom_point(aes(size = MoSS), alpha = 0.85) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
+  annotate(
+    "text",
+    x = -Inf,
+    y = Inf,
+    label = rho_label_lr,
+    hjust = -0.05,
+    vjust = 1.2,
+    size = 5
+  ) +
+  labs(
+    x = "Neutrophil ligand/alarmin pseudobulk score",
+    y = "Monocyte receptor/inflammasome pseudobulk score",
+    size = "MoSS"
+  ) +
+  theme_prism(base_size = 16) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_blank(),
+    legend.title = element_text(face = "bold")
+  )
+
+# -----------------------------
+# Pairwise gene-gene correlations
+# -----------------------------
+
+pairwise_lr_gene_correlations <- expand.grid(
+  neut_gene = neut_gene_cols,
+  mono_gene = mono_gene_cols,
+  stringsAsFactors = FALSE
+) %>%
+  rowwise() %>%
+  mutate(
+    spearman_rho = unname(cor.test(
+      lr_pseudobulk_coupling[[neut_gene]],
+      lr_pseudobulk_coupling[[mono_gene]],
+      method = "spearman",
+      exact = FALSE
+    )$estimate),
+    p_value = cor.test(
+      lr_pseudobulk_coupling[[neut_gene]],
+      lr_pseudobulk_coupling[[mono_gene]],
+      method = "spearman",
+      exact = FALSE
+    )$p.value
+  ) %>%
+  ungroup() %>%
+  mutate(
+    p_adj_BH = p.adjust(p_value, method = "BH"),
+    neut_gene = gsub("^neut_", "", neut_gene),
+    mono_gene = gsub("^mono_", "", mono_gene)
+  ) %>%
+  arrange(desc(abs(spearman_rho)))
+
+write.csv(
+  pairwise_lr_gene_correlations,
+  "cross_compartment_pairwise_neutrophil_monocyte_gene_correlations.csv",
+  row.names = FALSE
+)
+
+# Preserve input gene order rather than alphabetical order
+pairwise_lr_gene_correlations$neut_gene <- factor(
+  pairwise_lr_gene_correlations$neut_gene,
+  levels = neut_lr_genes_present
+)
+
+pairwise_lr_gene_correlations$mono_gene <- factor(
+  pairwise_lr_gene_correlations$mono_gene,
+  levels = mono_lr_genes_present
+)
+
+pairwise_lr_heatmap <- ggplot(
+  pairwise_lr_gene_correlations,
+  aes(
+    x = mono_gene,
+    y = neut_gene,
+    fill = spearman_rho
+  )
+) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(spearman_rho, 2)), size = 3.4) +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    limits = c(-1, 1),
+    name = "Spearman rho"
+  ) +
+  labs(
+    x = "Monocyte receptor/inflammasome genes",
+    y = "Neutrophil ligand/alarmin genes"
+  ) +
+  theme_prism(base_size = 15) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_blank(),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1,
+      face = "italic",
+      size = 12,
+      margin = margin(t = -1)
+    ),
+    axis.text.y = element_text(
+      face = "italic",
+      size = 12
+    ),
+    axis.title.x = element_text(
+      margin = margin(t = -2)
+    ),
+    axis.title.y = element_text(
+      margin = margin(r = 8)
+    ),
+    legend.title = element_text(face = "bold"),
+    legend.position = "right",
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 5)
+  )
+
+# -----------------------------
+# Combine plots 
+# -----------------------------
+
+cross_compartment_lr_combined_plot <- ggarrange(
+  lr_pseudobulk_coupling_plot,
+  pairwise_lr_heatmap,
+  ncol = 2,
+  nrow = 1,
+  labels = c("A", "B"),
+  font.label = list(size = 18, face = "bold"),
+  widths = c(1, 1.2),
+  align = "hv"
+)
+
+cross_compartment_lr_combined_plot
+
+
+
+					   
