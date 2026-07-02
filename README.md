@@ -4,7 +4,7 @@ This repository contains the analysis code for derivation, validation, and exter
 projection of the Multi-omic Systemic Host-Response Score (MoSS).
 MoSS is a multi-omic latent factor derived from integrated RNA-seq, proteomics,
 and immune cell composition data that captures a coordinated host-response axis
-of severe infection and related critical illness.
+of sepsis and severe infection.
 
 ## Publication
 
@@ -14,8 +14,8 @@ Kiwubeyi M, Nankwanga R, RESERVE-U Study Team, Nie K, Xie H, Miake-Lye S,
 Villagomez B, Reynolds SJ, Oduro G, Genzor P, Chenoweth JG, Chamnan P,
 Limmathurotsakul D, Krueger M, Gharib SA, West TE, Lipkin WI, O'Donnell MR,
 Kim-Schulze S, Ghosh S, Floratos A††, Bakamutumaho B††.
-A multi-omic host-response axis for stratification of severe infection and
-critical illness. *Under review*, 2026.
+A conserved multi-omic host-response axis links inflammatory myeloid states 
+to organ dysfunction and mortality in sepsis. *Under review*, 2026.
 
 \* Corresponding author (mjc2244@columbia.edu)
 
