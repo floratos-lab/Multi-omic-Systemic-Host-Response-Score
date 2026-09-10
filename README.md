@@ -1,4 +1,4 @@
-# MoSS: A Multi-omic Host-Response Axis for Stratification of Severe Infection and Critical Illness
+# MoSS: A Multi-omic Host-Response Axis for Stratification of Sepsis and Severe Infection
 
 This repository contains the analysis code for derivation, validation, and external
 projection of the Multi-omic Systemic Host-Response Score (MoSS).
@@ -14,8 +14,9 @@ Kiwubeyi M, Nankwanga R, RESERVE-U Study Team, Nie K, Xie H, Miake-Lye S,
 Villagomez B, Reynolds SJ, Oduro G, Genzor P, Chenoweth JG, Chamnan P,
 Limmathurotsakul D, Krueger M, Gharib SA, West TE, Lipkin WI, O'Donnell MR,
 Kim-Schulze S, Ghosh S, Floratos A††, Bakamutumaho B††.
-A conserved multi-omic host-response axis links inflammatory myeloid states 
-to organ dysfunction and mortality in sepsis. *Under review*, 2026.
+A quantitative host-response axis for stratification of sepsis and severe 
+infection in low- and middle-income countries: analysis of two prospective 
+Ugandan cohorts with international validation. 
 
 \* Corresponding author (mjc2244@columbia.edu)
 
