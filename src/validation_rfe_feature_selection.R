@@ -55,7 +55,7 @@
 #       4. Assess feature concordance across sizes: Jaccard similarity matrix,
 #          core features (sizes 5–10), per-size composition, and stability
 #          frequency across all tested sizes.
-#       5. Select signature size (post-hoc decision: size 15 by default).
+#       5. Select signature size (post-hoc decision: size 14).
 #       6. Retrain final linear model on the full discovery cohort at the
 #          selected size.
 #       7. Apply final model to the validation cohort; compute Pearson r, R²,
