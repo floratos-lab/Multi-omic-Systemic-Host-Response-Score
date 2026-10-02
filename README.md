@@ -8,19 +8,7 @@ of sepsis and severe infection.
 
 ## Publication
 
-Cummings MJ\*, Lu X, Lutwama JJ, Owor N, Ross JE, Tomoiaga AS, Eliku JP,
-Asasira I, Kiyingi T, Nsereko C, Nayiga I, Nsubuga JB, Shinyale J,
-Kiwubeyi M, Nankwanga R, RESERVE-U Study Team, Nie K, Xie H, Miake-Lye S,
-Villagomez B, Reynolds SJ, Oduro G, Genzor P, Chenoweth JG, Chamnan P,
-Limmathurotsakul D, Krueger M, Gharib SA, West TE, Lipkin WI, O'Donnell MR,
-Kim-Schulze S, Ghosh S, Floratos A††, Bakamutumaho B††.
-A quantitative host-response axis for stratification of sepsis and severe 
-infection in low- and middle-income countries: analysis of two prospective 
-Ugandan cohorts with international validation. 
-
-\* Corresponding author (mjc2244@columbia.edu)
-
-†† Co-senior authors
+Under review.
 
 ## Repository Structure
 
