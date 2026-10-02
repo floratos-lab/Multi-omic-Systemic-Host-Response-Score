@@ -957,8 +957,23 @@ neut_gene_cols <- setdiff(neut_gene_cols, c("neut_cells"))
 mono_gene_cols <- setdiff(mono_gene_cols, c("mono_cells", "cmono_cells"))
 
 # Explicitly use dplyr::select to avoid namespace conflicts
-neut_scaled_mat <- scale(as.matrix(dplyr::select(lr_pseudobulk_coupling, dplyr::all_of(neut_gene_cols))))
-mono_scaled_mat <- scale(as.matrix(dplyr::select(lr_pseudobulk_coupling, dplyr::all_of(mono_gene_cols))))
+neut_scaled_mat <- scale(
+  as.matrix(
+    dplyr::select(
+      lr_pseudobulk_coupling,
+      dplyr::all_of(neut_gene_cols)
+    )
+  )
+)
+
+mono_scaled_mat <- scale(
+  as.matrix(
+    dplyr::select(
+      lr_pseudobulk_coupling,
+      dplyr::all_of(mono_gene_cols)
+    )
+  )
+)
 
 lr_pseudobulk_coupling$neut_ligand_alarmin_pseudobulk_score <- rowMeans(
   neut_scaled_mat,
@@ -978,23 +993,146 @@ write.csv(
 )
 
 # -----------------------------
-# Correlate neutrophil ligand/alarmin pseudobulk score with monocyte score
+# Exact Spearman permutation-test helper
 # -----------------------------
 
-cor_lr_pseudobulk <- cor.test(
+all_permutations <- function(x) {
+  
+  if (length(x) == 1) {
+    return(matrix(x, nrow = 1))
+  }
+  
+  out <- lapply(seq_along(x), function(i) {
+    
+    rest <- x[-i]
+    rest_perm <- all_permutations(rest)
+    
+    cbind(
+      x[i],
+      rest_perm
+    )
+  })
+  
+  do.call(
+    rbind,
+    out
+  )
+}
+
+exact_spearman_permutation <- function(x, y) {
+  
+  keep <- complete.cases(x, y)
+  
+  x <- as.numeric(x[keep])
+  y <- as.numeric(y[keep])
+  
+  n <- length(x)
+  
+  if (n < 3) {
+    return(
+      list(
+        estimate = NA_real_,
+        p.value = NA_real_,
+        n = n,
+        n_permutations = NA_integer_
+      )
+    )
+  }
+  
+  rho_obs <- suppressWarnings(
+    cor(
+      x,
+      y,
+      method = "spearman"
+    )
+  )
+  
+  # Generate all permutations of participant indices.
+  perm_index <- all_permutations(
+    seq_len(n)
+  )
+  
+  rho_perm <- apply(
+    perm_index,
+    1,
+    function(idx) {
+      suppressWarnings(
+        cor(
+          x,
+          y[idx],
+          method = "spearman"
+        )
+      )
+    }
+  )
+  
+  # Small numerical tolerance avoids floating-point boundary issues.
+  tol <- sqrt(.Machine$double.eps)
+  
+  p_exact <- mean(
+    abs(rho_perm) >= abs(rho_obs) - tol
+  )
+  
+  list(
+    estimate = rho_obs,
+    p.value = p_exact,
+    n = n,
+    n_permutations = nrow(perm_index)
+  )
+}
+
+# -----------------------------
+# Correlate neutrophil ligand/alarmin pseudobulk score with monocyte score
+# using exact permutation inference
+# -----------------------------
+
+cor_lr_pseudobulk <- exact_spearman_permutation(
   lr_pseudobulk_coupling$neut_ligand_alarmin_pseudobulk_score,
-  lr_pseudobulk_coupling$mono_receptor_inflammasome_pseudobulk_score,
-  method = "spearman",
-  exact = FALSE
+  lr_pseudobulk_coupling$mono_receptor_inflammasome_pseudobulk_score
+)
+
+cat("\nCross-compartment exact Spearman permutation test:\n")
+cat(
+  "N participants =",
+  cor_lr_pseudobulk$n,
+  "\n"
+)
+cat(
+  "Observed Spearman rho =",
+  round(cor_lr_pseudobulk$estimate, 6),
+  "\n"
+)
+cat(
+  "Number of exact permutations =",
+  cor_lr_pseudobulk$n_permutations,
+  "\n"
+)
+cat(
+  "Two-sided exact permutation p =",
+  format(
+    cor_lr_pseudobulk$p.value,
+    digits = 6
+  ),
+  "\n"
 )
 
 lr_pseudobulk_cor_summary <- data.frame(
-  comparison = "Neutrophil ligand/alarmin pseudobulk score vs monocyte receptor/inflammasome pseudobulk score",
-  spearman_rho = unname(cor_lr_pseudobulk$estimate),
-  p_value = cor_lr_pseudobulk$p.value,
-  n_participants = nrow(lr_pseudobulk_coupling),
-  neutrophil_genes = paste(neut_lr_genes_present, collapse = ";"),
-  monocyte_genes = paste(mono_lr_genes_present, collapse = ";")
+  comparison = paste0(
+    "Neutrophil ligand/alarmin pseudobulk score vs ",
+    "monocyte receptor/inflammasome pseudobulk score"
+  ),
+  spearman_rho = cor_lr_pseudobulk$estimate,
+  p_value_exact_permutation = cor_lr_pseudobulk$p.value,
+  n_participants = cor_lr_pseudobulk$n,
+  n_permutations = cor_lr_pseudobulk$n_permutations,
+  neutrophil_genes = paste(
+    neut_lr_genes_present,
+    collapse = ";"
+  ),
+  monocyte_genes = paste(
+    mono_lr_genes_present,
+    collapse = ";"
+  )
 )
 
 write.csv(
@@ -1013,11 +1151,22 @@ print(lr_pseudobulk_cor_summary)
 library(ggpubr)
 
 rho_label_lr <- paste0(
-  "Spearman rho = ", round(unname(cor_lr_pseudobulk$estimate), 2),
-  "\nP = ", signif(cor_lr_pseudobulk$p.value, 2)
+  "Spearman rho = ",
+  round(
+    cor_lr_pseudobulk$estimate,
+    2
+  ),
+  "\nExact P = ",
+  signif(
+    cor_lr_pseudobulk$p.value,
+    3
+  )
 )
 
+# -----------------------------
 # Panel A: participant-level pseudobulk module correlation
+# -----------------------------
+
 lr_pseudobulk_coupling_plot <- ggplot(
   lr_pseudobulk_coupling,
   aes(
@@ -1025,8 +1174,15 @@ lr_pseudobulk_coupling_plot <- ggplot(
     y = mono_receptor_inflammasome_pseudobulk_score
   )
 ) +
-  geom_point(aes(size = MoSS), alpha = 0.85) +
-  geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
+  geom_point(
+    aes(size = MoSS),
+    alpha = 0.85
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    linewidth = 0.8
+  ) +
   annotate(
     "text",
     x = -Inf,
@@ -1041,15 +1197,19 @@ lr_pseudobulk_coupling_plot <- ggplot(
     y = "Monocyte receptor/inflammasome pseudobulk score",
     size = "MoSS"
   ) +
-  theme_prism(base_size = 16) +
+  theme_prism(
+    base_size = 16
+  ) +
   theme(
     panel.grid = element_blank(),
     plot.title = element_blank(),
-    legend.title = element_text(face = "bold")
+    legend.title = element_text(
+      face = "bold"
+    )
   )
 
 # -----------------------------
-# Pairwise gene-gene correlations
+# Panel B: pairwise gene-gene correlations
 # -----------------------------
 
 pairwise_lr_gene_correlations <- expand.grid(
@@ -1059,26 +1219,40 @@ pairwise_lr_gene_correlations <- expand.grid(
 ) %>%
   rowwise() %>%
   mutate(
-    spearman_rho = unname(cor.test(
-      lr_pseudobulk_coupling[[neut_gene]],
-      lr_pseudobulk_coupling[[mono_gene]],
-      method = "spearman",
-      exact = FALSE
-    )$estimate),
-    p_value = cor.test(
-      lr_pseudobulk_coupling[[neut_gene]],
-      lr_pseudobulk_coupling[[mono_gene]],
-      method = "spearman",
-      exact = FALSE
-    )$p.value
+    exact_test = list(
+      exact_spearman_permutation(
+        lr_pseudobulk_coupling[[neut_gene]],
+        lr_pseudobulk_coupling[[mono_gene]]
+      )
+    ),
+    spearman_rho = exact_test$estimate,
+    p_value_exact = exact_test$p.value
   ) %>%
   ungroup() %>%
-  mutate(
-    p_adj_BH = p.adjust(p_value, method = "BH"),
-    neut_gene = gsub("^neut_", "", neut_gene),
-    mono_gene = gsub("^mono_", "", mono_gene)
+  dplyr::select(
+    -exact_test
   ) %>%
-  arrange(desc(abs(spearman_rho)))
+  mutate(
+    p_adj_BH = p.adjust(
+      p_value_exact,
+      method = "BH"
+    ),
+    neut_gene = gsub(
+      "^neut_",
+      "",
+      neut_gene
+    ),
+    mono_gene = gsub(
+      "^mono_",
+      "",
+      mono_gene
+    )
+  ) %>%
+  arrange(
+    desc(
+      abs(spearman_rho)
+    )
+  )
 
 write.csv(
   pairwise_lr_gene_correlations,
@@ -1105,8 +1279,18 @@ pairwise_lr_heatmap <- ggplot(
     fill = spearman_rho
   )
 ) +
-  geom_tile(color = "white") +
-  geom_text(aes(label = round(spearman_rho, 2)), size = 3.4) +
+  geom_tile(
+    color = "white"
+  ) +
+  geom_text(
+    aes(
+      label = round(
+        spearman_rho,
+        2
+      )
+    ),
+    size = 3.4
+  ) +
   scale_fill_gradient2(
     low = "#2166AC",
     mid = "white",
@@ -1119,7 +1303,9 @@ pairwise_lr_heatmap <- ggplot(
     x = "Monocyte receptor/inflammasome genes",
     y = "Neutrophil ligand/alarmin genes"
   ) +
-  theme_prism(base_size = 15) +
+  theme_prism(
+    base_size = 15
+  ) +
   theme(
     panel.grid = element_blank(),
     plot.title = element_blank(),
@@ -1141,13 +1327,20 @@ pairwise_lr_heatmap <- ggplot(
     axis.title.y = element_text(
       margin = margin(r = 8)
     ),
-    legend.title = element_text(face = "bold"),
+    legend.title = element_text(
+      face = "bold"
+    ),
     legend.position = "right",
-    plot.margin = margin(t = 5, r = 5, b = 5, l = 5)
+    plot.margin = margin(
+      t = 5,
+      r = 5,
+      b = 5,
+      l = 5
+    )
   )
 
 # -----------------------------
-# Combine plots 
+# Combine plots
 # -----------------------------
 
 cross_compartment_lr_combined_plot <- ggarrange(
@@ -1156,13 +1349,15 @@ cross_compartment_lr_combined_plot <- ggarrange(
   ncol = 2,
   nrow = 1,
   labels = c("A", "B"),
-  font.label = list(size = 18, face = "bold"),
-  widths = c(1, 1.2),
+  font.label = list(
+    size = 18,
+    face = "bold"
+  ),
+  widths = c(
+    1,
+    1.2
+  ),
   align = "hv"
 )
 
 cross_compartment_lr_combined_plot
-
-
-
-					   
